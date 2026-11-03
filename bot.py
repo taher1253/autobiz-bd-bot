@@ -1,6 +1,8 @@
 
 import os
 import secrets
+import httpx
+
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -22,22 +24,44 @@ STATUSES = {
 }
 
 
-def is_admin(update: Update):
+def is_admin(update):
     admin_id = os.environ.get("ADMIN_CHAT_ID")
-    return admin_id and str(update.effective_chat.id) == admin_id
+    return bool(
+        admin_id and update.effective_chat
+        and str(update.effective_chat.id) == admin_id
+    )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def db_url():
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    if not url:
+        raise RuntimeError("SUPABASE_URL missing")
+    return url + "/rest/v1/orders"
+
+
+def db_headers():
+    key = os.environ.get("SUPABASE_KEY")
+    if not key:
+        raise RuntimeError("SUPABASE_KEY missing")
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json"
+    }
+
+
+async def start(update, context):
     await update.message.reply_text(
         "স্বাগতম AutoBiz BD-তে! 🇧🇩\n\n"
         "/services - আমাদের সেবা\n"
         "/order - অর্ডার করুন\n"
+        "/orders - অর্ডার তালিকা (Admin)\n"
         "/contact - যোগাযোগ\n"
         "/myid - Telegram ID"
     )
 
 
-async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def services(update, context):
     await update.message.reply_text(
         "🌟 AutoBiz BD-এর সেবাসমূহ\n\n"
         "১. 🎨 ডিজিটাল ডিজাইন\n"
@@ -45,12 +69,12 @@ async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "২. 🌐 ওয়েবসাইট তৈরি\n"
         "ব্যবসার ওয়েবসাইট, ল্যান্ডিং পেজ ও Blogger সাইট।\n\n"
         "৩. 🤖 AutoBiz Smart Solutions\n"
-        "Telegram বট, অটোমেশন, Excel হিসাব, PDF ও অফিস ডকুমেন্ট।\n\n"
+        "Telegram বট, অটোমেশন, Excel, PDF ও অফিস ডকুমেন্ট।\n\n"
         "অর্ডার করতে /order লিখুন।"
     )
 
 
-async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def order_start(update, context):
     keyboard = [[s] for s in SERVICES]
     await update.message.reply_text(
         "কোন সার্ভিসটি নিতে চান?",
@@ -61,11 +85,11 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_SERVICE
 
 
-async def choose_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_service(update, context):
     service = update.message.text
 
     if service not in SERVICES:
-        await update.message.reply_text("নিচের বাটন থেকে একটি সার্ভিস বেছে নিন।")
+        await update.message.reply_text("নিচের বাটন থেকে সার্ভিস বেছে নিন।")
         return CHOOSING_SERVICE
 
     context.user_data["service"] = service
@@ -77,71 +101,93 @@ async def choose_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ORDER_DETAILS
 
 
-async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_order(update, context):
     user = update.effective_user
     admin_id = os.environ.get("ADMIN_CHAT_ID")
 
     if not admin_id:
         await update.message.reply_text("অর্ডার সিস্টেমে সমস্যা হয়েছে।")
-        context.user_data.clear()
         return ConversationHandler.END
 
     order_id = "ABD-" + secrets.token_hex(3).upper()
 
-    service = context.user_data.get("service", "অজানা")
-    details = update.message.text
-
     order = {
         "id": order_id,
-        "service": service,
-        "name": user.full_name,
+        "service": context.user_data.get("service", "অজানা"),
+        "customer_name": user.full_name,
         "username": user.username or "নেই",
         "chat_id": update.effective_chat.id,
-        "details": details,
+        "details": update.message.text,
         "status": "pending"
     }
 
-    orders = context.application.bot_data.setdefault("orders", {})
-    orders[order_id] = order
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                db_url(),
+                headers={**db_headers(), "Prefer": "return=minimal"},
+                json=order
+            )
+            response.raise_for_status()
+
+    except Exception:
+        await update.message.reply_text(
+            "অর্ডার ডেটাবেজে সংরক্ষণ করা যায়নি। পরে আবার চেষ্টা করুন।"
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
 
     admin_message = (
         "🆕 নতুন AutoBiz BD অর্ডার\n\n"
         f"Order ID: {order_id}\n"
-        f"সার্ভিস: {service}\n"
+        f"সার্ভিস: {order['service']}\n"
         f"গ্রাহক: {user.full_name}\n"
         f"ইউজারনেম: @{user.username or 'নেই'}\n"
-        f"Chat ID: {update.effective_chat.id}\n\n"
-        f"বিস্তারিত:\n{details}\n\n"
+        f"Chat ID: {order['chat_id']}\n\n"
+        f"বিস্তারিত:\n{order['details']}\n\n"
         "স্ট্যাটাস: Pending"
     )
 
     try:
         await context.bot.send_message(
-            chat_id=int(admin_id),
-            text=admin_message
-        )
-        await update.message.reply_text(
-            "✅ আপনার অর্ডার গ্রহণ করা হয়েছে!\n\n"
-            f"আপনার Order ID: {order_id}\n"
-            "বর্তমান অবস্থা: Pending\n\n"
-            "আপনার অর্ডারের অগ্রগতি আমাদের পক্ষ থেকে জানানো হবে।"
+            chat_id=int(admin_id), text=admin_message
         )
     except Exception:
-        orders.pop(order_id, None)
-        await update.message.reply_text(
-            "অর্ডার পাঠানো যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।"
-        )
+        pass
+
+    await update.message.reply_text(
+        "✅ আপনার অর্ডার গ্রহণ করা হয়েছে!\n\n"
+        f"আপনার Order ID: {order_id}\n"
+        "বর্তমান অবস্থা: Pending\n\n"
+        "আপনার অর্ডারের অগ্রগতি জানানো হবে।"
+    )
 
     context.user_data.clear()
     return ConversationHandler.END
 
 
-async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def orders_command(update, context):
     if not is_admin(update):
-        await update.message.reply_text("⛔ এই কমান্ড শুধু অ্যাডমিনের জন্য।")
+        await update.message.reply_text("⛔ শুধু অ্যাডমিনের জন্য।")
         return
 
-    orders = context.application.bot_data.get("orders", {})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                db_url(),
+                headers=db_headers(),
+                params={
+                    "select": "id,service,customer_name,status,created_at",
+                    "order": "created_at.desc",
+                    "limit": "15"
+                }
+            )
+            response.raise_for_status()
+            orders = response.json()
+
+    except Exception:
+        await update.message.reply_text("ডেটাবেজ থেকে অর্ডার আনা যায়নি।")
+        return
 
     if not orders:
         await update.message.reply_text("এখনো কোনো অর্ডার নেই।")
@@ -149,26 +195,24 @@ async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📋 AutoBiz BD অর্ডার তালিকা\n"]
 
-    for order in list(orders.values())[-15:]:
-        status = STATUSES.get(order["status"], order["status"])
+    for order in orders:
         lines.append(
             f"ID: {order['id']}\n"
             f"সার্ভিস: {order['service']}\n"
-            f"গ্রাহক: {order['name']}\n"
-            f"অবস্থা: {status}\n"
+            f"গ্রাহক: {order['customer_name']}\n"
+            f"অবস্থা: {STATUSES[order['status']]}\n"
         )
 
     await update.message.reply_text("\n".join(lines))
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_command(update, context):
     if not is_admin(update):
-        await update.message.reply_text("⛔ এই কমান্ড শুধু অ্যাডমিনের জন্য।")
+        await update.message.reply_text("⛔ শুধু অ্যাডমিনের জন্য।")
         return
 
     if len(context.args) != 2:
         await update.message.reply_text(
-            "ব্যবহার:\n"
             "/status ORDER_ID pending\n"
             "/status ORDER_ID processing\n"
             "/status ORDER_ID completed"
@@ -178,43 +222,66 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = context.args[0].upper()
     new_status = context.args[1].lower()
 
-    orders = context.application.bot_data.get("orders", {})
-    order = orders.get(order_id)
-
-    if not order:
-        await update.message.reply_text("এই Order ID পাওয়া যায়নি।")
-        return
-
     if new_status not in STATUSES:
         await update.message.reply_text(
-            "সঠিক স্ট্যাটাস লিখুন: pending, processing অথবা completed"
+            "pending, processing অথবা completed লিখুন।"
         )
         return
 
-    order["status"] = new_status
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                db_url(),
+                headers=db_headers(),
+                params={
+                    "select": "id,service,chat_id",
+                    "id": f"eq.{order_id}",
+                    "limit": "1"
+                }
+            )
+            response.raise_for_status()
+            rows = response.json()
 
-    customer_message = (
-        "📢 AutoBiz BD অর্ডার আপডেট\n\n"
-        f"Order ID: {order_id}\n"
-        f"সার্ভিস: {order['service']}\n"
-        f"নতুন অবস্থা: {STATUSES[new_status]}"
-    )
+            if not rows:
+                await update.message.reply_text("Order ID পাওয়া যায়নি।")
+                return
+
+            order = rows[0]
+
+            response = await client.patch(
+                db_url(),
+                headers={**db_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{order_id}"},
+                json={"status": new_status}
+            )
+            response.raise_for_status()
+
+    except Exception:
+        await update.message.reply_text("ডেটাবেজ আপডেট করা যায়নি।")
+        return
 
     try:
         await context.bot.send_message(
             chat_id=order["chat_id"],
-            text=customer_message
+            text=(
+                "📢 AutoBiz BD অর্ডার আপডেট\n\n"
+                f"Order ID: {order_id}\n"
+                f"সার্ভিস: {order['service']}\n"
+                f"নতুন অবস্থা: {STATUSES[new_status]}"
+            )
         )
         await update.message.reply_text(
             f"✅ {order_id}-এর স্ট্যাটাস আপডেট হয়েছে।"
         )
+
     except Exception:
         await update.message.reply_text(
-            "স্ট্যাটাস সংরক্ষণ হয়েছে, কিন্তু গ্রাহককে মেসেজ পাঠানো যায়নি।"
+            "ডেটাবেজে স্ট্যাটাস আপডেট হয়েছে, "
+            "কিন্তু গ্রাহককে মেসেজ পাঠানো যায়নি।"
         )
 
 
-async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_order(update, context):
     context.user_data.clear()
     await update.message.reply_text(
         "অর্ডার বাতিল করা হয়েছে।",
@@ -223,13 +290,13 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def contact(update, context):
     await update.message.reply_text(
         "যোগাযোগ করতে /order দিয়ে আপনার প্রয়োজন জানান।"
     )
 
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def myid(update, context):
     await update.message.reply_text(
         f"আপনার Telegram Chat ID: {update.effective_chat.id}"
     )
@@ -239,7 +306,7 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
     app = Application.builder().token(token).build()
 
@@ -251,9 +318,9 @@ def main():
             ],
             ORDER_DETAILS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_order)
-            ],
+            ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_order)],
+        fallbacks=[CommandHandler("cancel", cancel_order)]
     )
 
     app.add_handler(CommandHandler("start", start))
